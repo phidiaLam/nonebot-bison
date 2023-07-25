@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from collections import defaultdict
 
 from nonebot.log import logger
 from nonebot_plugin_apscheduler import scheduler
@@ -16,15 +17,17 @@ class Schedulable:
     platform_name: str
     target: Target
     current_weight: int
+    use_batch: bool = False
 
 
 class Scheduler:
-    schedulable_list: list[Schedulable]
+    schedulable_list: list[Schedulable]  # for load weigth from db
+    batch_api_target_cache: dict[str, dict[Target, list[Target]]]  # platform_name -> (target -> [target])
 
     def __init__(
         self,
         scheduler_config: type[SchedulerConfig],
-        schedulables: list[tuple[str, Target]],
+        schedulables: list[tuple[str, Target, bool]],  # [(platform_name, target, use_batch)]
         platform_name_list: list[str],
     ):
         self.name = scheduler_config.name
@@ -33,9 +36,21 @@ class Scheduler:
             raise RuntimeError(f"{self.name} not found")
         self.scheduler_config = scheduler_config
         self.scheduler_config_obj = self.scheduler_config()
+
         self.schedulable_list = []
-        for platform_name, target in schedulables:
-            self.schedulable_list.append(Schedulable(platform_name=platform_name, target=target, current_weight=0))
+        _batch_platform_name_targets_dict: dict[str, list[Target]] = defaultdict(list)
+        for platform_name, target, use_batch in schedulables:
+            if use_batch:
+                _batch_platform_name_targets_dict[platform_name].append(target)
+            self.schedulable_list.append(
+                Schedulable(platform_name=platform_name, target=target, current_weight=0, use_batch=use_batch)
+            )
+
+        self.batch_api_target_cache = defaultdict(dict)
+        for platform_name, targets in _batch_platform_name_targets_dict.items():
+            for target in targets:
+                self.batch_api_target_cache[platform_name][target] = targets
+
         self.platform_name_list = platform_name_list
         self.pre_weight_val = 0  # 轮调度中“本轮”增加权重和的初值
         logger.info(
@@ -69,14 +84,24 @@ class Scheduler:
         if not (schedulable := await self.get_next_schedulable()):
             return
         logger.trace(f"scheduler {self.name} fetching next target: [{schedulable.platform_name}]{schedulable.target}")
-        send_userinfo_list = await config.get_platform_target_subscribers(schedulable.platform_name, schedulable.target)
 
         client = await self.scheduler_config_obj.get_client(schedulable.target)
         context.register_to_client(client)
 
         try:
             platform_obj = platform_manager[schedulable.platform_name](context, client)
-            to_send = await platform_obj.do_fetch_new_post(schedulable.target, send_userinfo_list)
+            if schedulable.use_batch:
+                batch_targets = self.batch_api_target_cache[schedulable.platform_name][schedulable.target]
+                target_user_info_list = []
+                for batch_target in batch_targets:
+                    userinfo = await config.get_platform_target_subscribers(schedulable.platform_name, batch_target)
+                    target_user_info_list.append((batch_target, userinfo))
+                to_send = await platform_obj.do_batch_fetch_new_post(target_user_info_list)
+            else:
+                send_userinfo_list = await config.get_platform_target_subscribers(
+                    schedulable.platform_name, schedulable.target
+                )
+                to_send = await platform_obj.do_fetch_new_post(schedulable.target, send_userinfo_list)
         except Exception as err:
             records = context.gen_req_records()
             for record in records:
